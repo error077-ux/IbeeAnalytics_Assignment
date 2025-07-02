@@ -1,15 +1,11 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends, status
 from fastapi.responses import JSONResponse
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import HTTPBasic, HTTPBasicCredentials # <--- For basic HTTP Auth
 import pandas as pd
 import io
 import time
-from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
-from pydantic import BaseModel
-import json
-import jwt
-from passlib.context import CryptContext
+from typing import List, Dict, Any
+from pydantic import BaseModel # For defining input/output models
 
 # Import database functions from our database.py file
 from database import (
@@ -18,80 +14,42 @@ from database import (
     get_all_data,
     get_data_by_id,
     insert_log_entry,
-    get_all_logs,
-    hash_password,
-    get_user_by_username,
-    create_user
+    get_all_logs
+    # Removed: hash_password, get_user_by_username, create_user (no longer needed for static auth)
 )
 
 # Initialize the database (ensures tables exist)
 init_db()
 
-# --- Pydantic Models for User Authentication ---
-class User(BaseModel):
-    username: str
+# --- Static Username/Password Configuration ---
+# IMPORTANT: CHANGE THESE IN A REAL APPLICATION!
+STATIC_USERNAME = "admin"
+STATIC_PASSWORD = "password"
 
-class UserInDB(User):
-    hashed_password: str
+# HTTPBasic is used for basic authentication (username/password in header)
+basic_security = HTTPBasic()
 
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-
-class TokenData(BaseModel):
-    username: Optional[str] = None
-
-class UserCreate(BaseModel): # Model for user registration input
-    username: str
-    password: str
-
-# --- ADDED: Pydantic Model for AI Assistant Question Input ---
-class QuestionInput(BaseModel):
-    question: str
-# --- END ADDED SECTION ---
-
-# --- JWT Configuration ---
-SECRET_KEY = "your-jwt-super-secret-key-that-is-very-long-and-random-and-secure" # <--- CHANGE THIS!
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
-
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
-# --- JWT Token Functions ---
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-async def get_current_user(token: str = Depends(oauth2_scheme)):
-    credentials_exception = HTTPException(
+def authenticate_static_user(credentials: HTTPBasicCredentials = Depends(basic_security)):
+    """
+    Authenticates a user against a static username and password.
+    """
+    if credentials.username == STATIC_USERNAME and credentials.password == STATIC_PASSWORD:
+        return credentials.username
+    raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
+        detail="Incorrect username or password",
+        headers={"WWW-Authenticate": "Basic"},
     )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise credentials_exception
-        token_data = TokenData(username=username)
-    except jwt.PyJWTError:
-        raise credentials_exception
-    user = get_user_by_username(token_data.username)
-    if user is None:
-        raise credentials_exception
-    return user
 
 app = FastAPI(
     title="Data Upload and Query API",
-    description="A simple backend system to upload CSV files, validate data, store it, and query it, with basic API logging.",
+    description="A simple backend system to upload CSV files, validate data, store it, and query it, with basic API logging and a rule-based AI assistant.",
     version="1.0.0"
 )
+
+# --- Pydantic Model for AI Assistant Question Input ---
+class QuestionInput(BaseModel):
+    question: str
 
 # --- Middleware for API Logging ---
 @app.middleware("http")
@@ -121,54 +79,19 @@ async def read_root():
     """
     return {"message": "Welcome to the Data Upload and Query API! Use /docs for API documentation."}
 
-# --- User Registration Endpoint ---
-@app.post("/register/", response_model=User, summary="Register a new user", response_description="Registered user details")
-async def register_user(user_data: UserCreate):
-    """
-    Registers a new user with a unique username and password.
-    Password will be hashed before storing.
-    """
-    existing_user = get_user_by_username(user_data.username)
-    if existing_user:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username already registered")
-
-    hashed_pwd = hash_password(user_data.password)
-    user_id = create_user(user_data.username, hashed_pwd)
-
-    if user_id is None:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to register user due to a database error.")
-
-    return User(username=user_data.username)
-
-# --- User Login Endpoint ---
-@app.post("/token", response_model=Token, summary="Login and get access token", response_description="Access token for authentication")
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
-    """
-    Authenticates a user with username and password and returns an access token.
-    Use this token in the 'Authorization: Bearer YOUR_TOKEN' header for protected endpoints.
-    """
-    user = get_user_by_username(form_data.username)
-    if not user or hash_password(form_data.password) != user["hashed_password"]:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user["username"]}, expires_delta=access_token_expires
-    )
-    return {"access_token": access_token, "token_type": "bearer"}
-
 # --- CSV Upload Endpoint ---
 @app.post("/upload-csv/", summary="Upload CSV File", response_description="Confirmation of successful upload and data storage")
 async def upload_csv(
     file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user)
+    username: str = Depends(authenticate_static_user) # <--- Authenticated by static user
 ):
     """
     Uploads a CSV file, performs basic validation, and stores its data in the database.
-    (Requires a valid access token in the 'Authorization: Bearer' header)
+    (Requires Basic Authentication with username 'admin' and password 'password')
+
+    - **File Type Check**: Ensures the uploaded file is a CSV.
+    - **Data Validation**: Checks for missing values (NaN/None) in rows.
+    - **Data Storage**: Each row of the CSV is stored as a JSON string in the 'data' table.
     """
     if not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="Invalid file type. Only CSV files are allowed.")
@@ -224,11 +147,11 @@ async def get_single_data(item_id: int):
 # --- Query Logs Endpoint ---
 @app.get("/logs/", response_model=List[Dict[str, Any]], summary="Get All API Logs", response_description="List of all API request logs")
 async def get_logs(
-    current_user: User = Depends(get_current_user)
+    username: str = Depends(authenticate_static_user) # <--- Authenticated by static user
 ):
     """
     Retrieves all API request logs stored in the database.
-    (Requires a valid access token in the 'Authorization: Bearer' header)
+    (Requires Basic Authentication with username 'admin' and password 'password')
 
     Logs include timestamp, HTTP method, request path, response status code, and response time.
     """
@@ -239,12 +162,12 @@ async def get_logs(
 @app.post("/ask-data-ai/", summary="Ask AI about Stored Data", response_description="AI's answer to the question about the data")
 async def ask_data_ai(
     question_data: QuestionInput, # Uses QuestionInput MODEL
-    current_user: User = Depends(get_current_user)
+    username: str = Depends(authenticate_static_user) # <--- Authenticated by static user
 ):
     """
     Asks a rule-based assistant a question about the currently stored CSV data.
     It attempts to identify keywords in your question to retrieve specific data points.
-    (Requires a valid access token in the 'Authorization: Bearer' header)
+    (Requires Basic Authentication with username 'admin' and password 'password')
 
     - **Input**: A JSON object with a 'question' key, e.g., `{"question": "What is the price of apple?"}`
     - **Output**: The extracted data point or a message if not found.
